@@ -12,6 +12,7 @@
 ;; Data Variables
 (define-data-var total-ads uint u0)
 (define-data-var platform-fee uint u50) ;; 5% in basis points
+(define-data-var total-categories uint u0)
 
 ;; Data Maps
 (define-map Advertisements
@@ -163,3 +164,171 @@
 )
 
 
+(define-map Categories uint (string-ascii 20))
+
+(define-map AdCategories 
+    uint 
+    {category-id: uint}
+)
+
+(define-public (create-category (category-name (string-ascii 20)))
+    (let
+        ((category-id (+ (var-get total-categories) u1)))
+        (map-set Categories category-id category-name)
+        (var-set total-categories category-id)
+        (ok category-id)
+    )
+)
+
+(define-public (set-ad-category (ad-id uint) (category-id uint))
+    (let
+        ((ad (unwrap! (map-get? Advertisements ad-id) err-not-found)))
+        (asserts! (is-eq tx-sender (get advertiser ad)) err-owner-only)
+        (map-set AdCategories ad-id {category-id: category-id})
+        (ok true)
+    )
+)
+
+(define-map AdExpirations uint uint)
+
+(define-public (set-ad-expiration (ad-id uint) (blocks uint))
+    (let
+        ((ad (unwrap! (map-get? Advertisements ad-id) err-not-found))
+         (expiration (+ blocks stacks-block-height)))
+        (asserts! (is-eq tx-sender (get advertiser ad)) err-owner-only)
+        (map-set AdExpirations ad-id expiration)
+        (ok true)
+    )
+)
+
+(define-read-only (is-ad-expired (ad-id uint))
+    (let
+        ((expiration (unwrap! (map-get? AdExpirations ad-id) err-not-found)))
+        (ok (> stacks-block-height expiration))
+    )
+)
+
+(define-map AdBudgets
+    uint
+    {
+        daily-budget: uint,
+        spent-today: uint,
+        last-reset: uint
+    }
+)
+
+(define-public (set-daily-budget (ad-id uint) (budget uint))
+    (let
+        ((ad (unwrap! (map-get? Advertisements ad-id) err-not-found)))
+        (asserts! (is-eq tx-sender (get advertiser ad)) err-owner-only)
+        (map-set AdBudgets ad-id 
+            {
+                daily-budget: budget,
+                spent-today: u0,
+                last-reset: stacks-block-height
+            }
+        )
+        (ok true)
+    )
+)
+
+
+(define-map AudienceTargeting
+    uint
+    {
+        age-min: uint,
+        age-max: uint,
+        location: (string-ascii 50),
+        interests: (list 5 (string-ascii 20))
+    }
+)
+
+(define-public (set-targeting (ad-id uint) (age-min uint) (age-max uint) (location (string-ascii 50)) (interests (list 5 (string-ascii 20))))
+    (let
+        ((ad (unwrap! (map-get? Advertisements ad-id) err-not-found)))
+        (asserts! (is-eq tx-sender (get advertiser ad)) err-owner-only)
+        (map-set AudienceTargeting ad-id
+            {
+                age-min: age-min,
+                age-max: age-max,
+                location: location,
+                interests: interests
+            }
+        )
+        (ok true)
+    )
+)
+
+
+(define-constant reward-amount u10)
+
+(define-map UserRewards
+    principal
+    {
+        total-rewards: uint,
+        last-claim: uint
+    }
+)
+
+(define-public (claim-engagement-reward (ad-id uint))
+    (let
+        ((user-rewards (default-to {total-rewards: u0, last-claim: u0} (map-get? UserRewards tx-sender)))
+         (engagement (unwrap! (map-get? ViewerEngagement {ad-id: ad-id, viewer: tx-sender}) err-not-found)))
+        (asserts! (get clicked engagement) err-invalid-amount)
+        (try! (as-contract (stx-transfer? reward-amount tx-sender tx-sender)))
+        (map-set UserRewards tx-sender
+            {
+                total-rewards: (+ (get total-rewards user-rewards) reward-amount),
+                last-claim: stacks-block-height
+            }
+        )
+        (ok true)
+    )
+)
+
+
+(define-map AdAnalytics
+    uint
+    {
+        unique-viewers: uint,
+        conversion-rate: uint,
+        peak-hours: (list 24 uint),
+        viewer-retention: uint
+    }
+)
+
+(define-public (update-analytics (ad-id uint))
+    (let
+        ((ad (unwrap! (map-get? Advertisements ad-id) err-not-found))
+         (current-analytics (default-to {unique-viewers: u0, conversion-rate: u0, peak-hours: (list u0 u0 u0 u0 u0 u0 u0 u0 u0 u0 u0 u0 u0 u0 u0 u0 u0 u0 u0 u0 u0 u0 u0 u0), viewer-retention: u0} (map-get? AdAnalytics ad-id))))
+        (map-set AdAnalytics ad-id
+            (merge current-analytics {
+                unique-viewers: (+ (get unique-viewers current-analytics) u1)
+            })
+        )
+        (ok true)
+    )
+)
+
+
+(define-map Referrals
+    {ad-id: uint, referrer: principal}
+    {
+        referral-count: uint,
+        earned-rewards: uint
+    }
+)
+
+(define-public (track-referral (ad-id uint) (referrer principal))
+    (let
+        ((current-refs (default-to {referral-count: u0, earned-rewards: u0} 
+                      (map-get? Referrals {ad-id: ad-id, referrer: referrer}))))
+        (map-set Referrals {ad-id: ad-id, referrer: referrer}
+            {
+                referral-count: (+ (get referral-count current-refs) u1),
+                earned-rewards: (+ (get earned-rewards current-refs) u5)
+            }
+        )
+        (ok true)
+    )
+)
