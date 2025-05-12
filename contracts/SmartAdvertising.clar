@@ -332,3 +332,104 @@
         (ok true)
     )
 )
+
+
+(define-map AdPerformanceScores
+    uint
+    {
+        performance-score: uint,
+        last-updated: uint
+    }
+)
+
+(define-public (calculate-ad-performance (ad-id uint))
+    (let
+        ((ad (unwrap! (map-get? Advertisements ad-id) err-not-found))
+         (views (get total-views ad))
+         (clicks (get total-clicks ad))
+         (engagement-rate (if (is-eq views u0) 
+            u0 
+            (/ (* clicks u100) views)))
+         (score (* engagement-rate u10)))
+        
+        (map-set AdPerformanceScores ad-id
+            {
+                performance-score: score,
+                last-updated: stacks-block-height
+            }
+        )
+        (ok score)
+    )
+)
+
+(define-read-only (get-ad-performance-score (ad-id uint))
+    (ok (unwrap! (map-get? AdPerformanceScores ad-id) err-not-found))
+)
+
+
+(define-map PremiumSlots
+    uint
+    {
+        current-holder: principal,
+        bid-amount: uint,
+        expires-at: uint
+    }
+)
+
+(define-constant premium-slot-duration u144) ;; 1 day in blocks
+(define-constant minimum-premium-bid u1000)
+
+(define-public (bid-premium-slot (slot-id uint) (bid-amount uint))
+    (let
+        ((current-slot (default-to 
+            {current-holder: tx-sender, bid-amount: u0, expires-at: u0}
+            (map-get? PremiumSlots slot-id))))
+        
+        (asserts! (> bid-amount (get bid-amount current-slot)) err-invalid-amount)
+        (asserts! (>= bid-amount minimum-premium-bid) err-invalid-amount)
+        
+        (try! (stx-transfer? bid-amount tx-sender (as-contract tx-sender)))
+        
+        (if (> (get bid-amount current-slot) u0)
+            (try! (as-contract (stx-transfer? (get bid-amount current-slot) tx-sender (get current-holder current-slot))))
+            true
+        )
+        
+        (map-set PremiumSlots slot-id
+            {
+                current-holder: tx-sender,
+                bid-amount: bid-amount,
+                expires-at: (+ stacks-block-height premium-slot-duration)
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-premium-slot-info (slot-id uint))
+    (ok (unwrap! (map-get? PremiumSlots slot-id) err-not-found))
+)
+
+
+(define-public (withdraw-premium-slot (slot-id uint))
+    (let
+        ((current-slot (unwrap! (map-get? PremiumSlots slot-id) err-not-found)))
+        
+        (asserts! (is-eq tx-sender (get current-holder current-slot)) err-owner-only)
+        (asserts! (> stacks-block-height (get expires-at current-slot)) err-not-found)
+        
+        (try! (as-contract (stx-transfer? (get bid-amount current-slot) tx-sender tx-sender)))
+        
+        (map-set PremiumSlots slot-id
+            {
+                current-holder: tx-sender,
+                bid-amount: u0,
+                expires-at: u0
+            }
+        )
+        (ok true)
+    )
+)
+(define-public (get-premium-slot-bid (slot-id uint))
+    (ok (unwrap! (map-get? PremiumSlots slot-id) err-not-found))
+)
