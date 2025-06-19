@@ -5,6 +5,11 @@ authors = []
 telemetry = true
 cache_dir = '.\.cache'
 requirements = []
+[contracts.AdAuction]
+path = 'contracts/AdAuction.clar'
+clarity_version = 3
+epoch = 3.1
+
 [contracts.SmartAdvertising]
 path = 'contracts/SmartAdvertising.clar'
 clarity_version = 3
