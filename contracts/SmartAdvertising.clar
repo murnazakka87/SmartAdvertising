@@ -433,3 +433,118 @@
 (define-public (get-premium-slot-bid (slot-id uint))
     (ok (unwrap! (map-get? PremiumSlots slot-id) err-not-found))
 )
+
+(define-constant reputation-bronze-threshold u50)
+(define-constant reputation-silver-threshold u100)
+(define-constant reputation-gold-threshold u200)
+(define-constant reputation-platinum-threshold u500)
+
+(define-constant bronze-discount u100)
+(define-constant silver-discount u200)
+(define-constant gold-discount u350)
+(define-constant platinum-discount u500)
+
+(define-map ReputationTiers
+    principal
+    {
+        tier: (string-ascii 10),
+        tier-level: uint,
+        discount-amount: uint,
+        last-updated: uint
+    }
+)
+
+(define-public (calculate-reputation-tier (advertiser principal))
+    (let
+        ((stats (default-to 
+            {total-ads: u0, total-stake: u0, reputation-score: u100}
+            (map-get? AdvertiserStats advertiser)))
+         (tier-info
+            (if (>= (get reputation-score stats) reputation-platinum-threshold)
+                {tier: "platinum", tier-level: u4, discount-amount: platinum-discount}
+                (if (>= (get reputation-score stats) reputation-gold-threshold)
+                    {tier: "gold", tier-level: u3, discount-amount: gold-discount}
+                    (if (>= (get reputation-score stats) reputation-silver-threshold)
+                        {tier: "silver", tier-level: u2, discount-amount: silver-discount}
+                        (if (>= (get reputation-score stats) reputation-bronze-threshold)
+                            {tier: "bronze", tier-level: u1, discount-amount: bronze-discount}
+                            {tier: "none", tier-level: u0, discount-amount: u0}
+                        )
+                    )
+                )
+            )
+         )
+        )
+        
+        (map-set ReputationTiers advertiser
+            (merge tier-info {last-updated: stacks-block-height}))
+        
+        (ok (get tier-level tier-info))
+    )
+)
+
+(define-read-only (get-minimum-stake-for-advertiser (advertiser principal))
+    (let
+        ((tier-info (default-to 
+            {tier: "none", tier-level: u0, discount-amount: u0, last-updated: u0}
+            (map-get? ReputationTiers advertiser))))
+        
+        (ok (- minimum-stake-amount (get discount-amount tier-info)))
+    )
+)
+
+(define-read-only (get-advertiser-tier (advertiser principal))
+    (ok (map-get? ReputationTiers advertiser))
+)
+
+(define-public (update-advertiser-reputation (advertiser principal) (performance-bonus uint))
+    (let
+        ((current-stats (default-to 
+            {total-ads: u0, total-stake: u0, reputation-score: u100}
+            (map-get? AdvertiserStats advertiser)))
+         (new-reputation (+ (get reputation-score current-stats) performance-bonus)))
+        
+        (map-set AdvertiserStats advertiser
+            (merge current-stats {reputation-score: new-reputation}))
+        
+        (unwrap! (calculate-reputation-tier advertiser) err-not-found)
+        (ok true)
+    )
+)
+
+(define-public (create-advertisement-with-tier (title (string-ascii 50)) (content (string-ascii 200)) (stake-amount uint))
+    (let
+        ((new-ad-id (+ (var-get total-ads) u1))
+         (advertiser-stats (default-to 
+            {total-ads: u0, total-stake: u0, reputation-score: u100}
+            (map-get? AdvertiserStats tx-sender)))
+         (minimum-required (unwrap! (get-minimum-stake-for-advertiser tx-sender) err-invalid-amount)))
+        
+        (asserts! (>= stake-amount minimum-required) err-invalid-amount)
+        (try! (stx-transfer? stake-amount tx-sender (as-contract tx-sender)))
+        
+        (map-set Advertisements new-ad-id
+            {
+                advertiser: tx-sender,
+                title: title,
+                content: content,
+                stake-amount: stake-amount,
+                total-views: u0,
+                total-clicks: u0,
+                active: true,
+                created-at: stacks-block-height
+            }
+        )
+
+        (map-set AdvertiserStats tx-sender
+            {
+                total-ads: (+ (get total-ads advertiser-stats) u1),
+                total-stake: (+ (get total-stake advertiser-stats) stake-amount),
+                reputation-score: (get reputation-score advertiser-stats)
+            }
+        )
+
+        (var-set total-ads new-ad-id)
+        (ok new-ad-id)
+    )
+)
