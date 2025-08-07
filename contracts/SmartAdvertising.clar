@@ -434,6 +434,298 @@
     (ok (unwrap! (map-get? PremiumSlots slot-id) err-not-found))
 )
 
+;; === DYNAMIC PRICING MARKET SYSTEM ===
+
+;; Constants for dynamic pricing
+(define-constant base-price-multiplier u100) ;; 100% baseline
+(define-constant peak-hour-multiplier u150) ;; 150% during peak hours  
+(define-constant off-peak-multiplier u75) ;; 75% during off-peak hours
+(define-constant high-demand-threshold u10) ;; When 10+ ads are active
+(define-constant low-demand-threshold u3) ;; When 3 or fewer ads are active
+(define-constant demand-surge-multiplier u200) ;; 200% during high demand
+(define-constant low-demand-discount u50) ;; 50% during low demand
+(define-constant max-price-history u48) ;; Store 48 periods of pricing history
+
+;; Time periods (in blocks, roughly 1 hour = 6 blocks)
+(define-constant peak-start-hour u32) ;; Block 32 of daily cycle
+(define-constant peak-end-hour u42) ;; Block 42 of daily cycle
+(define-constant daily-block-cycle u144) ;; 24 hours in blocks
+
+;; Data structures for dynamic pricing
+(define-map MarketConditions
+    uint ;; timestamp-period
+    {
+        active-ads-count: uint,
+        current-multiplier: uint,
+        base-price: uint,
+        demand-level: (string-ascii 10) ;; "low", "normal", "high"
+    }
+)
+
+(define-map PriceHistory
+    uint ;; period-index
+    {
+        timestamp: uint,
+        price-multiplier: uint,
+        total-volume: uint,
+        period-revenue: uint
+    }
+)
+
+(define-map AutoBidders
+    principal ;; advertiser
+    {
+        max-bid-limit: uint,
+        target-position: uint, ;; Preferred ranking position
+        auto-bidding-active: bool,
+        current-bid: uint,
+        last-bid-time: uint
+    }
+)
+
+(define-map MarketMetrics
+    uint ;; metric-id (always 1 for singleton)
+    {
+        total-market-volume: uint,
+        average-price-multiplier: uint,
+        peak-demand-reached: uint,
+        current-period: uint,
+        next-price-update: uint
+    }
+)
+
+;; Data variables for market state
+(define-data-var current-market-period uint u0)
+(define-data-var total-autobidders uint u0)
+(define-data-var market-revenue-pool uint u0)
+
+;; Calculate current time-based pricing multiplier
+(define-read-only (get-time-based-multiplier)
+    (let
+        ((current-block stacks-block-height)
+         (daily-position (mod current-block daily-block-cycle)))
+        
+        (if (and (>= daily-position peak-start-hour) (<= daily-position peak-end-hour))
+            peak-hour-multiplier
+            off-peak-multiplier
+        )
+    )
+)
+
+;; Calculate demand-based pricing multiplier
+(define-read-only (get-demand-multiplier)
+    (let
+        ((active-count (var-get total-ads)))
+        
+        (if (>= active-count high-demand-threshold)
+            demand-surge-multiplier
+            (if (<= active-count low-demand-threshold)
+                low-demand-discount
+                base-price-multiplier
+            )
+        )
+    )
+)
+
+;; Get current dynamic market price
+(define-read-only (get-current-market-price)
+    (let
+        ((time-multiplier (get-time-based-multiplier))
+         (demand-multiplier (get-demand-multiplier))
+         (combined-multiplier (/ (* time-multiplier demand-multiplier) u100))
+         (dynamic-price (/ (* minimum-stake-amount combined-multiplier) u100)))
+        
+        (ok dynamic-price)
+    )
+)
+
+;; Update market conditions for current period
+(define-public (update-market-conditions)
+    (let
+        ((current-period (var-get current-market-period))
+         (active-ads (var-get total-ads))
+         (current-price (unwrap! (get-current-market-price) err-invalid-amount))
+         (time-mult (get-time-based-multiplier))
+         (demand-mult (get-demand-multiplier))
+         (combined-mult (/ (* time-mult demand-mult) u100))
+         (demand-level (if (>= active-ads high-demand-threshold)
+            "high"
+            (if (<= active-ads low-demand-threshold)
+                "low"
+                "normal"))))
+        
+        ;; Update current market conditions
+        (map-set MarketConditions current-period
+            {
+                active-ads-count: active-ads,
+                current-multiplier: combined-mult,
+                base-price: current-price,
+                demand-level: demand-level
+            }
+        )
+        
+        ;; Store price history
+        (map-set PriceHistory current-period
+            {
+                timestamp: stacks-block-height,
+                price-multiplier: combined-mult,
+                total-volume: active-ads,
+                period-revenue: (var-get market-revenue-pool)
+            }
+        )
+        
+        ;; Update metrics
+        (map-set MarketMetrics u1
+            {
+                total-market-volume: (+ (default-to u0 (get total-market-volume (map-get? MarketMetrics u1))) active-ads),
+                average-price-multiplier: combined-mult,
+                peak-demand-reached: (if (is-eq demand-level "high") 
+                    (+ (default-to u0 (get peak-demand-reached (map-get? MarketMetrics u1))) u1)
+                    (default-to u0 (get peak-demand-reached (map-get? MarketMetrics u1)))),
+                current-period: current-period,
+                next-price-update: (+ stacks-block-height u6) ;; Update every 6 blocks
+            }
+        )
+        
+        (var-set current-market-period (+ current-period u1))
+        (ok true)
+    )
+)
+
+;; Enable automatic bidding for advertisers
+(define-public (enable-auto-bidding (max-bid-limit uint) (target-position uint))
+    (begin
+        (asserts! (> max-bid-limit minimum-stake-amount) err-invalid-amount)
+        (asserts! (> target-position u0) err-invalid-amount)
+        
+        (map-set AutoBidders tx-sender
+            {
+                max-bid-limit: max-bid-limit,
+                target-position: target-position,
+                auto-bidding-active: true,
+                current-bid: u0,
+                last-bid-time: stacks-block-height
+            }
+        )
+        
+        (var-set total-autobidders (+ (var-get total-autobidders) u1))
+        (ok true)
+    )
+)
+
+;; Create advertisement with dynamic pricing
+(define-public (create-ad-dynamic-pricing (title (string-ascii 50)) (content (string-ascii 200)))
+    (let
+        ((dynamic-price (unwrap! (get-current-market-price) err-invalid-amount))
+         (auto-bidder (map-get? AutoBidders tx-sender))
+         (final-bid (match auto-bidder
+            bidder-info (if (and 
+                            (get auto-bidding-active bidder-info)
+                            (<= dynamic-price (get max-bid-limit bidder-info)))
+                        dynamic-price
+                        (get max-bid-limit bidder-info))
+            dynamic-price))
+         (new-ad-id (+ (var-get total-ads) u1)))
+        
+        (asserts! (>= final-bid dynamic-price) err-invalid-amount)
+        (try! (stx-transfer? final-bid tx-sender (as-contract tx-sender)))
+        
+        ;; Update market revenue pool
+        (var-set market-revenue-pool (+ (var-get market-revenue-pool) final-bid))
+        
+        ;; Create the advertisement
+        (map-set Advertisements new-ad-id
+            {
+                advertiser: tx-sender,
+                title: title,
+                content: content,
+                stake-amount: final-bid,
+                total-views: u0,
+                total-clicks: u0,
+                active: true,
+                created-at: stacks-block-height
+            }
+        )
+        
+        ;; Update advertiser stats
+        (let
+            ((advertiser-stats (default-to 
+                {total-ads: u0, total-stake: u0, reputation-score: u100}
+                (map-get? AdvertiserStats tx-sender))))
+            
+            (map-set AdvertiserStats tx-sender
+                {
+                    total-ads: (+ (get total-ads advertiser-stats) u1),
+                    total-stake: (+ (get total-stake advertiser-stats) final-bid),
+                    reputation-score: (get reputation-score advertiser-stats)
+                }
+            )
+        )
+        
+        ;; Update auto-bidder current bid if applicable
+        (match auto-bidder
+            bidder-info (map-set AutoBidders tx-sender
+                (merge bidder-info {current-bid: final-bid, last-bid-time: stacks-block-height}))
+            true
+        )
+        
+        (var-set total-ads new-ad-id)
+        (try! (update-market-conditions))
+        (ok new-ad-id)
+    )
+)
+
+;; Get market insights and analytics
+(define-read-only (get-market-analytics)
+    (let
+        ((current-conditions (map-get? MarketConditions (var-get current-market-period)))
+         (market-metrics (map-get? MarketMetrics u1))
+         (current-price (unwrap! (get-current-market-price) err-invalid-amount)))
+        
+        (ok {
+            current-price: current-price,
+            time-multiplier: (get-time-based-multiplier),
+            demand-multiplier: (get-demand-multiplier),
+            market-conditions: current-conditions,
+            market-metrics: market-metrics,
+            total-autobidders: (var-get total-autobidders),
+            revenue-pool: (var-get market-revenue-pool)
+        })
+    )
+)
+
+;; Disable automatic bidding
+(define-public (disable-auto-bidding)
+    (let
+        ((auto-bidder (unwrap! (map-get? AutoBidders tx-sender) err-not-found)))
+        
+        (map-set AutoBidders tx-sender
+            (merge auto-bidder {auto-bidding-active: false}))
+        
+        (var-set total-autobidders (- (var-get total-autobidders) u1))
+        (ok true)
+    )
+)
+
+;; Get price history for analysis
+(define-read-only (get-price-history (start-period uint) (end-period uint))
+    (let
+        ((period-range (- end-period start-period)))
+        
+        (asserts! (<= period-range u20) err-invalid-amount) ;; Limit to 20 periods max
+        (ok {
+            start-period: start-period,
+            end-period: end-period,
+            sample-data: (map-get? PriceHistory start-period)
+        })
+    )
+)
+
+;; Get auto-bidder information
+(define-read-only (get-auto-bidder-info (advertiser principal))
+    (ok (map-get? AutoBidders advertiser))
+)
+
 (define-constant reputation-bronze-threshold u50)
 (define-constant reputation-silver-threshold u100)
 (define-constant reputation-gold-threshold u200)
@@ -548,3 +840,5 @@
         (ok new-ad-id)
     )
 )
+
+
