@@ -14,6 +14,15 @@ epoch = 3.1
 path = 'contracts/SmartAdvertising.clar'
 clarity_version = 3
 epoch = 3.1
+
+[contracts.AdvertisingIntelligence]
+path = 'contracts/AdvertisingIntelligence.clar'
+clarity_version = 3
+epoch = 3.1
+[contracts.CampaignScheduler]
+path = 'contracts/CampaignScheduler.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
